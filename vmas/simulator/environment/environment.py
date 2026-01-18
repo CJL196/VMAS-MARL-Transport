@@ -30,6 +30,10 @@ from vmas.simulator.utils import (
 
 @contextlib.contextmanager
 def local_seed(vmas_random_state):
+    """
+    上下文管理器，用于在局部范围内设置随机种子，并在退出时恢复之前的随机状态。
+    这确保了 VMAS 环境的随机性不会污染外部的全局随机状态。
+    """
     torch_state = torch.random.get_rng_state()
     np_state = np.random.get_state()
     py_state = random.getstate()
@@ -38,10 +42,12 @@ def local_seed(vmas_random_state):
     np.random.set_state(vmas_random_state[1])
     random.setstate(vmas_random_state[2])
     yield
+    # 保存当前的随机状态以便下次恢复
     vmas_random_state[0] = torch.random.get_rng_state()
     vmas_random_state[1] = np.random.get_state()
     vmas_random_state[2] = random.getstate()
 
+    # 恢复之前的随机状态
     torch.random.set_rng_state(torch_state)
     np.random.set_state(np_state)
     random.setstate(py_state)
@@ -49,13 +55,14 @@ def local_seed(vmas_random_state):
 
 class Environment(TorchVectorizedObject):
     """
-    The VMAS environment
+    VMAS 环境类，遵循 OpenAI Gym 接口风格，但支持向量化（并行环境）。
     """
 
     metadata = {
         "render.modes": ["human", "rgb_array"],
         "runtime.vectorized": True,
     }
+    # 存储环境内部的随机状态
     vmas_random_state = [
         torch.random.get_rng_state(),
         np.random.get_state(),
@@ -83,28 +90,39 @@ class Environment(TorchVectorizedObject):
                 not continuous_actions
             ), "When asking for multidiscrete_actions, make sure continuous_actions=False"
 
+        # scenario: 场景实例，定义了特定的任务逻辑
         self.scenario = scenario
+        # num_envs: 并行环境的数量
         self.num_envs = num_envs
         TorchVectorizedObject.__init__(self, num_envs, torch.device(device))
+        # 创建物理世界
         self.world = self.scenario.env_make_world(self.num_envs, self.device, **kwargs)
 
+        # 获取受策略控制的智能体列表
         self.agents = self.world.policy_agents
         self.n_agents = len(self.agents)
+        # 最大步数限制
         self.max_steps = max_steps
+        # 是否使用连续动作空间
         self.continuous_actions = continuous_actions
+        # 是否使用字典形式的空间定义
         self.dict_spaces = dict_spaces
+        # 是否对动作进行截断
         self.clamp_action = clamp_actions
+        # 是否启用梯度传递（允许 end-to-end 训练）
         self.grad_enabled = grad_enabled
+        # 是否区分 terminated 和 truncated 状态 (Gymnasium 风格)
         self.terminated_truncated = terminated_truncated
 
+        # 初始化观测
         observations = self._reset(seed=seed)
 
-        # configure spaces
+        # configure spaces: 配置动作空间和观测空间
         self.multidiscrete_actions = multidiscrete_actions
         self.action_space = self.get_action_space()
         self.observation_space = self.get_observation_space(observations)
 
-        # rendering
+        # rendering: 渲染相关变量
         self.viewer = None
         self.headless = None
         self.visible_display = None
@@ -119,8 +137,9 @@ class Environment(TorchVectorizedObject):
         return_dones: bool = False,
     ):
         """
-        Resets the environment in a vectorized way
-        Returns observations for all envs and agents
+        重置环境。
+        Returns:
+             所有并行环境的初始观测。
         """
         return self._reset(
             seed=seed,
@@ -138,8 +157,8 @@ class Environment(TorchVectorizedObject):
         return_dones: bool = False,
     ):
         """
-        Resets the environment at index
-        Returns observations for all agents in that environment
+        重置指定索引的并行环境。
+        用于部分环境完成任务后的自动重置。
         """
         return self._reset_at(
             index=index,
@@ -158,19 +177,7 @@ class Environment(TorchVectorizedObject):
         dict_agent_names: Optional[bool] = None,
     ):
         """
-        Get the environment data from the scenario
-
-        Args:
-            get_observations (bool): whether to return the observations
-            get_rewards (bool): whether to return the rewards
-            get_infos (bool): whether to return the infos
-            get_dones (bool): whether to return the dones
-            dict_agent_names (bool, optional): whether to return the information in a dictionary with agent names as keys
-                or in a list
-
-        Returns:
-            The agents' data
-
+        从场景中获取当前的数据（观测、奖励、信息、Done标志）。
         """
         return self._get_from_scenario(
             get_observations=get_observations,
@@ -183,21 +190,14 @@ class Environment(TorchVectorizedObject):
     @local_seed(vmas_random_state)
     def seed(self, seed=None):
         """
-        Sets the seed for the environment
-        Args:
-            seed (int, optional): Seed for the environment. Defaults to None.
-
+        设置环境的随机种子。
         """
         return self._seed(seed=seed)
 
     @local_seed(vmas_random_state)
     def done(self):
         """
-        Get the done flags for the scenario.
-
-        Returns:
-            Either terminated, truncated (if self.terminated_truncated==True) or terminated + truncated (if self.terminated_truncated==False)
-
+        获取当前场景的 Done 标志。
         """
         return self._done()
 
@@ -209,16 +209,17 @@ class Environment(TorchVectorizedObject):
         return_dones: bool = False,
     ):
         """
-        Resets the environment in a vectorized way
-        Returns observations for all envs and agents
+        重置环境的内部实现。
         """
 
         if seed is not None:
             self._seed(seed)
-        # reset world
+        # reset world: 重置世界状态
         self.scenario.env_reset_world_at(env_index=None)
+        # 重置步数计数器
         self.steps = torch.zeros(self.num_envs, device=self.device)
 
+        # 获取初始观测
         result = self._get_from_scenario(
             get_observations=return_observations,
             get_infos=return_info,

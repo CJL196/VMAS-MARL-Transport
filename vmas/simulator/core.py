@@ -46,10 +46,14 @@ if typing.TYPE_CHECKING:
 
 
 class TorchVectorizedObject(object):
+    """
+    TorchVectorizedObject 是所有支持向量化操作对象的基类。
+    它主要管理 batch_dim (并行环境数量) 和 device (运行设备，CPU或GPU)。
+    """
     def __init__(self, batch_dim: int = None, device: torch.device = None):
-        # batch dim
+        # batch dim: 并行环境的数量，通常对应 num_envs
         self._batch_dim = batch_dim
-        # device
+        # device: 张量存储和计算的设备
         self._device = device
 
     @property
@@ -70,12 +74,14 @@ class TorchVectorizedObject(object):
         self._device = device
 
     def _check_batch_index(self, batch_index: int):
+        """检查 batch 索引是否越界"""
         if batch_index is not None:
             assert (
                 0 <= batch_index < self.batch_dim
             ), f"Index must be between 0 and {self.batch_dim}, got {batch_index}"
 
     def to(self, device: torch.device):
+        """将对象内的所有 Tensor 属性移动到指定设备"""
         self.device = device
         for attr, value in self.__dict__.items():
             if isinstance(value, Tensor):
@@ -83,24 +89,32 @@ class TorchVectorizedObject(object):
 
 
 class Shape(ABC):
+    """
+    形状基类，定义了物理模拟所需的几何属性接口。
+    """
     @abstractmethod
     def moment_of_inertia(self, mass: float):
+        """计算转动惯量"""
         raise NotImplementedError
 
     @abstractmethod
     def get_delta_from_anchor(self, anchor: Tuple[float, float]) -> Tuple[float, float]:
+        """计算相对于锚点的位移"""
         raise NotImplementedError
 
     @abstractmethod
     def get_geometry(self):
+        """获取用于渲染的几何对象"""
         raise NotImplementedError
 
     @abstractmethod
     def circumscribed_radius(self):
+        """计算外接圆半径"""
         raise NotImplementedError
 
 
 class Box(Shape):
+    """矩形形状"""
     def __init__(self, length: float = 0.3, width: float = 0.1, hollow: bool = False):
         super().__init__()
         assert length > 0, f"Length must be > 0, got {length}"
@@ -121,6 +135,7 @@ class Box(Shape):
         return anchor[X] * self.length / 2, anchor[Y] * self.width / 2
 
     def moment_of_inertia(self, mass: float):
+        # 矩形的转动惯量公式: I = m * (L^2 + W^2) / 12
         return (1 / 12) * mass * (self.length**2 + self.width**2)
 
     def circumscribed_radius(self):
@@ -139,6 +154,7 @@ class Box(Shape):
 
 
 class Sphere(Shape):
+    """圆形形状"""
     def __init__(self, radius: float = 0.05):
         super().__init__()
         assert radius > 0, f"Radius must be > 0, got {radius}"
@@ -158,6 +174,7 @@ class Sphere(Shape):
         return tuple(delta.tolist())
 
     def moment_of_inertia(self, mass: float):
+        # 实心圆盘的转动惯量公式: I = 0.5 * m * r^2
         return (1 / 2) * mass * self.radius**2
 
     def circumscribed_radius(self):
@@ -170,6 +187,7 @@ class Sphere(Shape):
 
 
 class Line(Shape):
+    """线段形状"""
     def __init__(self, length: float = 0.5):
         super().__init__()
         assert length > 0, f"Length must be > 0, got {length}"
@@ -204,15 +222,19 @@ class Line(Shape):
 
 
 class EntityState(TorchVectorizedObject):
+    """
+    实体的物理状态，包含位置、速度、旋转角度和角速度。
+    所有属性都是 Pytorch Tensor，支持并行环境操作。
+    """
     def __init__(self):
         super().__init__()
-        # physical position
+        # 物理位置 (x, y)
         self._pos = None
-        # physical velocity
+        # 物理速度 (vx, vy)
         self._vel = None
-        # physical rotation -- from -pi to pi
+        # 物理旋转角度 (radians) -- 范围 -pi 到 pi
         self._rot = None
-        # angular velocity
+        # 角速度
         self._ang_vel = None
 
     @property
@@ -284,6 +306,7 @@ class EntityState(TorchVectorizedObject):
         self._rot = rot.to(self._device)
 
     def _reset(self, env_index: typing.Optional[int]):
+        """重置状态为0，或者重置特定环境索引的状态"""
         for attr_name in ["pos", "rot", "vel", "ang_vel"]:
             attr = self.__getattribute__(attr_name)
             if attr is not None:
@@ -296,12 +319,14 @@ class EntityState(TorchVectorizedObject):
                     )
 
     def zero_grad(self):
+        """分离梯度，用于在不反向传播时节省计算资源"""
         for attr_name in ["pos", "rot", "vel", "ang_vel"]:
             attr = self.__getattribute__(attr_name)
             if attr is not None:
                 self.__setattr__(attr_name, attr.detach())
 
     def _spawn(self, dim_c: int, dim_p: int):
+        """初始化状态张量为全0"""
         self.pos = torch.zeros(
             self.batch_dim, dim_p, device=self.device, dtype=torch.float32
         )
@@ -317,15 +342,19 @@ class EntityState(TorchVectorizedObject):
 
 
 class AgentState(EntityState):
+    """
+    智能体的状态，继承自实体状态。
+    增加了通信状态 (c) 以及受到的力和力矩 (force, torque)。
+    """
     def __init__(
         self,
     ):
         super().__init__()
-        # communication utterance
+        # communication utterance: 通信内容
         self._c = None
-        # Agent force from actions
+        # Agent force from actions: 动作产生的力
         self._force = None
-        # Agent torque from actions
+        # Agent torque from actions: 动作产生的力矩
         self._torque = None
 
     @property
@@ -412,6 +441,11 @@ class AgentState(EntityState):
 
 # action of an agent
 class Action(TorchVectorizedObject):
+    """
+    智能体的动作对象。
+    包含物理动作 (u) 和通信动作 (c)。
+    还定义了动作的范围、乘数可以噪声参数。
+    """
     def __init__(
         self,
         u_range: Union[float, Sequence[float]],
@@ -420,18 +454,18 @@ class Action(TorchVectorizedObject):
         action_size: int,
     ):
         super().__init__()
-        # physical motor noise amount
+        # physical motor noise amount: 动作噪声大小
         self._u_noise = u_noise
-        # control range
+        # control range: 控制范围（截断值）
         self._u_range = u_range
-        # agent action is a force multiplied by this amount
+        # agent action is a force multiplied by this amount: 动作力度乘数（灵敏度）
         self._u_multiplier = u_multiplier
-        # Number of actions
+        # Number of actions: 动作维度
         self.action_size = action_size
 
-        # physical action
+        # physical action: 物理动作张量
         self._u = None
-        # communication_action
+        # communication_action: 通信动作张量
         self._c = None
 
         self._u_range_tensor = None
@@ -536,6 +570,11 @@ class Action(TorchVectorizedObject):
 
 # properties and state of physical world entity
 class Entity(TorchVectorizedObject, Observable, ABC):
+    """
+    物理世界实体的基类。
+    继承自 TorchVectorizedObject (支持批处理) 和 Observable (可被观测)。
+    可以是静态的地标，也可以是动态的智能体。
+    """
     def __init__(
         self,
         name: str,
@@ -560,37 +599,37 @@ class Entity(TorchVectorizedObject, Observable, ABC):
 
         TorchVectorizedObject.__init__(self)
         Observable.__init__(self)
-        # name
+        # name: 实体名称
         self._name = name
-        # entity can move / be pushed
+        # entity can move / be pushed: 是否可移动
         self._movable = movable
-        # entity can rotate
+        # entity can rotate: 是否可旋转
         self._rotatable = rotatable
-        # entity collides with others
+        # entity collides with others: 是否参与碰撞检测
         self._collide = collide
-        # material density (affects mass)
+        # material density (affects mass): 密度（暂未使用）
         self._density = density
-        # mass
+        # mass: 质量
         self._mass = mass
-        # max speed
+        # max speed: 最大速度限制
         self._max_speed = max_speed
         self._v_range = v_range
-        # color
+        # color: 渲染颜色
         self._color = color
-        # shape
+        # shape: 几何形状 (Shape对象)
         self._shape = shape
-        # is joint
+        # is joint: 是否是关节的一部分
         self._is_joint = is_joint
-        # collision filter
+        # collision filter: 碰撞过滤器，决定是否与特定实体碰撞
         self._collision_filter = collision_filter
-        # state
+        # state: 物理状态 (位置, 速度, 旋转等)
         self._state = EntityState()
-        # drag
+        # drag: 空气阻力系数
         self._drag = drag
-        # friction
+        # friction: 线性摩擦和角度摩擦系数
         self._linear_friction = linear_friction
         self._angular_friction = angular_friction
-        # gravity
+        # gravity: 重力加速度 (可以是标量或向量)
         if isinstance(gravity, Tensor):
             self._gravity = gravity
         else:
@@ -599,9 +638,9 @@ class Entity(TorchVectorizedObject, Observable, ABC):
                 if gravity is not None
                 else gravity
             )
-        # entity goal
+        # entity goal: 绑定的目标实体
         self._goal = None
-        # Render the entity
+        # Render the entity: 是否渲染该实体的标志
         self._render = None
 
     @TorchVectorizedObject.batch_dim.setter
@@ -619,6 +658,7 @@ class Entity(TorchVectorizedObject, Observable, ABC):
         self._render = torch.full((self.batch_dim,), True, device=self.device)
 
     def collides(self, entity: Entity):
+        # 检查是否应该与给定实体碰撞
         if not self.collide:
             return False
         return self._collision_filter(entity)
@@ -787,6 +827,9 @@ class Entity(TorchVectorizedObject, Observable, ABC):
 
 # properties of landmark entities
 class Landmark(Entity):
+    """
+    地标实体类。通常是静态物体、目标点或障碍物。
+    """
     def __init__(
         self,
         name: str,
@@ -828,6 +871,9 @@ class Landmark(Entity):
 
 # properties of agent entities
 class Agent(Entity):
+    """
+    智能体实体类。能执行动作、观测环境并与其他实体交互。
+    """
     def __init__(
         self,
         name: str,
@@ -899,36 +945,36 @@ class Agent(Entity):
                     f"All values in discrete_action_nvec must be greater than 1, got {discrete_action_nvec}"
                 )
 
-        # cannot observe the world
+        # cannot observe the world: 观测范围，None 表示无限
         self._obs_range = obs_range
-        # observation noise
+        # observation noise: 观测噪声
         self._obs_noise = obs_noise
-        # force constraints
+        # force constraints: 力的大小限制
         self._f_range = f_range
         self._max_f = max_f
-        # torque constraints
+        # torque constraints: 力矩限制
         self._t_range = t_range
         self._max_t = max_t
-        # script behavior to execute
+        # script behavior to execute: 预定义脚本行为（用于脚本化智能体）
         self._action_script = action_script
-        # agents sensors
+        # agents sensors: 传感器列表
         self._sensors = []
         if sensors is not None:
             [self.add_sensor(sensor) for sensor in sensors]
-        # non differentiable communication noise
+        # non differentiable communication noise: 通信噪声
         self._c_noise = c_noise
-        # cannot send communication signals
+        # cannot send communication signals: 是否静默（不能发送消息）
         self._silent = silent
-        # render the agent action force
+        # render the agent action force: 可视化动作力向量
         self._render_action = render_action
-        # is adversary
+        # is adversary: 是否是对手（用于竞争场景）
         self._adversary = adversary
-        # Render alpha
+        # Render alpha: 渲染透明度
         self._alpha = alpha
 
-        # Dynamics
+        # Dynamics: 动力学模型，默认为全向移动 (Holonomic)
         self.dynamics = dynamics if dynamics is not None else Holonomic()
-        # Action
+        # Action: 动作空间配置
         if action_size is not None:
             self.action_size = action_size
         elif discrete_action_nvec is not None:
@@ -947,7 +993,7 @@ class Agent(Entity):
             action_size=self.action_size,
         )
 
-        # state
+        # state: 智能体状态
         self._state = AgentState()
 
     def add_sensor(self, sensor: Sensor):
@@ -964,6 +1010,7 @@ class Agent(Entity):
         return self._action_script
 
     def action_callback(self, world: World):
+        """执行脚本行为的回调函数"""
         self._action_script(self, world)
         if self._silent or world.dim_c == 0:
             assert (
@@ -1088,6 +1135,10 @@ class Agent(Entity):
 
 # Multi-agent world
 class World(TorchVectorizedObject):
+    """
+    World 类负责管理所有的实体（智能体、地标）和物理模拟。
+    它是整个仿真环境的核心容器。
+    """
     def __init__(
         self,
         batch_dim: int,
@@ -1110,34 +1161,42 @@ class World(TorchVectorizedObject):
 
         super().__init__(batch_dim, device)
         # list of agents and entities (can change at execution-time!)
+        # 智能体和地标列表
         self._agents = []
         self._landmarks = []
         # world dims: no boundaries if none
+        # 世界边界半长（如果为None则无边界）
         self._x_semidim = x_semidim
         self._y_semidim = y_semidim
         # position dimensionality
+        # 物理位置维度 (目前仅支持 2D)
         self._dim_p = 2
         # communication channel dimensionality
+        # 通信信道维度
         self._dim_c = dim_c
         # simulation timestep
+        # 仿真时间步长 (dt)
         self._dt = dt
+        # 子步数（用于物理计算的稳定性，特别是有关节时）
         self._substeps = substeps
         self._sub_dt = self._dt / self._substeps
-        # drag coefficient
+        # drag coefficient: 空气阻力
         self._drag = drag
-        # gravity
+        # gravity: 重力
         self._gravity = torch.tensor(gravity, device=self.device, dtype=torch.float32)
-        # friction coefficients
+        # friction coefficients: 摩擦系数
         self._linear_friction = linear_friction
         self._angular_friction = angular_friction
         # constraint response parameters
+        # 约束响应参数 (碰撞力、关节力等)
         self._collision_force = collision_force
         self._joint_force = joint_force
         self._contact_margin = contact_margin
         self._torque_constraint_force = torque_constraint_force
-        # joints
+        # joints: 关节字典
         self._joints = {}
         # Pairs of collidable shapes
+        # 可碰撞的形状对集合
         self._collidable_pairs = [
             {Sphere, Sphere},
             {Sphere, Box},
@@ -1146,11 +1205,12 @@ class World(TorchVectorizedObject):
             {Line, Box},
             {Box, Box},
         ]
-        # Map to save entity indexes
+        # Map to save entity indexes: 实体索引映射
         self.entity_index_map = {}
 
     def add_agent(self, agent: Agent):
         """Only way to add agents to the world"""
+        """向世界添加智能体"""
         agent.batch_dim = self._batch_dim
         agent.to(self._device)
         agent._spawn(dim_c=self._dim_c, dim_p=self.dim_p)
@@ -1158,12 +1218,14 @@ class World(TorchVectorizedObject):
 
     def add_landmark(self, landmark: Landmark):
         """Only way to add landmarks to the world"""
+        """向世界添加地标"""
         landmark.batch_dim = self._batch_dim
         landmark.to(self._device)
         landmark._spawn(dim_c=self.dim_c, dim_p=self.dim_p)
         self._landmarks.append(landmark)
 
     def add_joint(self, joint: Joint):
+        """向世界添加关节约束"""
         assert self._substeps > 1, "For joints, world substeps needs to be more than 1"
         if joint.landmark is not None:
             self.add_landmark(joint.landmark)
@@ -1177,10 +1239,12 @@ class World(TorchVectorizedObject):
             )
 
     def reset(self, env_index: int):
+        """重置世界到初始状态"""
         for e in self.entities:
             e._reset(env_index)
 
     def zero_grad(self):
+        """将所有实体的梯度置零"""
         for e in self.entities:
             e.zero_grad()
 
