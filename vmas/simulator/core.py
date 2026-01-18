@@ -2032,15 +2032,36 @@ class World(TorchVectorizedObject):
             return_value = return_value[env_index]
         return return_value
 
-    # update state of the world
     def step(self):
+        """
+        执行一步物理仿真，更新世界状态。
+        
+        这是 VMAS 物理引擎的核心函数，实现了论文公式 (1) 中的状态更新：
+        
+        力的计算:
+            f_i(t) = f_i^a(t) + f_i^g + Σ_j f_ij^e(t)
+        
+        其中:
+            - f_i^a: 智能体的动作力
+            - f_i^g: 重力
+            - f_ij^e: 实体间的碰撞力
+        
+        状态积分使用半隐式欧拉方法 (Semi-implicit Euler):
+            v(t+1) = (1-ζ)·v(t) + (f/m)·dt
+            x(t+1) = x(t) + v(t+1)·dt
+        
+        支持子步 (substeps) 以提高物理稳定性，特别是在使用关节约束时。
+        """
+        # 建立实体到索引的映射，用于后续向量化操作
         self.entity_index_map = {e: i for i, e in enumerate(self.entities)}
 
+        # 子步循环：将一个时间步分成多个小步，提高仿真精度和稳定性
         for substep in range(self._substeps):
+            # 初始化力和力矩字典（每个实体一个向量化的力/力矩张量）
             self.forces_dict = {
                 e: torch.zeros(
-                    self._batch_dim,
-                    self._dim_p,
+                    self._batch_dim,   # 并行环境数量
+                    self._dim_p,       # 位置维度 (2D)
                     device=self.device,
                     dtype=torch.float32,
                 )
@@ -2049,31 +2070,35 @@ class World(TorchVectorizedObject):
             self.torques_dict = {
                 e: torch.zeros(
                     self._batch_dim,
-                    1,
+                    1,  # 2D 中只有一个旋转轴
                     device=self.device,
                     dtype=torch.float32,
                 )
                 for e in self.entities
             }
 
+            # === 第一阶段：收集各种力 ===
             for entity in self.entities:
                 if isinstance(entity, Agent):
-                    # apply agent force controls
+                    # 应用智能体的动作力（由策略网络输出）
                     self._apply_action_force(entity)
-                    # apply agent torque controls
+                    # 应用智能体的动作力矩（旋转控制）
                     self._apply_action_torque(entity)
-                # apply friction
+                # 应用摩擦力（线性和角度）
                 self._apply_friction_force(entity)
-                # apply gravity
+                # 应用重力
                 self._apply_gravity(entity)
 
+            # === 第二阶段：计算碰撞力和关节约束力 ===
+            # 这是向量化的碰撞检测和响应，支持多种形状组合
             self._apply_vectorized_enviornment_force()
 
+            # === 第三阶段：状态积分 ===
             for entity in self.entities:
-                # integrate physical state
+                # 使用半隐式欧拉方法更新位置和速度
                 self._integrate_state(entity, substep)
 
-        # update non-differentiable comm state
+        # 更新通信状态（如果场景支持通信）
         if self._dim_c > 0:
             for agent in self._agents:
                 self._update_comm_state(agent)
@@ -2921,18 +2946,44 @@ class World(TorchVectorizedObject):
 
         return -torque, torque
 
-    # integrate physical state
-    # uses semi-implicit euler with sub-stepping
     def _integrate_state(self, entity: Entity, substep: int):
+        """
+        使用半隐式欧拉方法 (Semi-implicit Euler) 积分物理状态。
+        
+        半隐式欧拉方法的特点:
+        - 先更新速度，再用新速度更新位置
+        - 比显式欧拉更稳定，能量守恒更好
+        - 计算简单，适合实时仿真
+        
+        线性运动更新 (对应论文公式):
+            v(t+1) = (1-ζ)·v(t) + (f/m)·dt     # 速度阻尼 + 加速
+            x(t+1) = x(t) + v(t+1)·dt           # 位置积分
+        
+        角运动更新:
+            ω(t+1) = (1-ζ)·ω(t) + (τ/I)·dt     # 角速度阻尼 + 角加速
+            θ(t+1) = θ(t) + ω(t+1)·dt           # 角度积分
+        
+        Args:
+            entity: 要更新的物理实体
+            substep: 当前子步索引（阻尼只在第一个子步应用）
+        """
         if entity.movable:
-            # Compute translation
+            # === 线性运动积分 ===
+            
+            # 速度阻尼（只在第一个子步应用，避免重复衰减）
             if substep == 0:
                 if entity.drag is not None:
                     entity.state.vel = entity.state.vel * (1 - entity.drag)
                 else:
                     entity.state.vel = entity.state.vel * (1 - self._drag)
+            
+            # 计算加速度: a = F / m
             accel = self.forces_dict[entity] / entity.mass
+            
+            # 更新速度: v = v + a * dt
             entity.state.vel = entity.state.vel + accel * self._sub_dt
+            
+            # 应用速度限制
             if entity.max_speed is not None:
                 entity.state.vel = TorchUtils.clamp_with_norm(
                     entity.state.vel, entity.max_speed
@@ -2941,7 +2992,11 @@ class World(TorchVectorizedObject):
                 entity.state.vel = entity.state.vel.clamp(
                     -entity.v_range, entity.v_range
                 )
+            
+            # 更新位置: x = x + v * dt
             new_pos = entity.state.pos + entity.state.vel * self._sub_dt
+            
+            # 应用世界边界约束（如果设置了边界）
             entity.state.pos = torch.stack(
                 [
                     (
@@ -2959,16 +3014,23 @@ class World(TorchVectorizedObject):
             )
 
         if entity.rotatable:
-            # Compute rotation
+            # === 角运动积分 ===
+            
+            # 角速度阻尼（只在第一个子步应用）
             if substep == 0:
                 if entity.drag is not None:
                     entity.state.ang_vel = entity.state.ang_vel * (1 - entity.drag)
                 else:
                     entity.state.ang_vel = entity.state.ang_vel * (1 - self._drag)
+            
+            # 更新角速度: ω = ω + (τ/I) * dt
+            # 其中 τ 是力矩，I 是转动惯量
             entity.state.ang_vel = (
                 entity.state.ang_vel
                 + (self.torques_dict[entity] / entity.moment_of_inertia) * self._sub_dt
             )
+            
+            # 更新角度: θ = θ + ω * dt
             entity.state.rot = entity.state.rot + entity.state.ang_vel * self._sub_dt
 
     def _update_comm_state(self, agent):
