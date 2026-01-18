@@ -1,4 +1,6 @@
-# VMAS 多智能体强化学习实验
+# VMAS-MARL-Transport
+
+[![GitHub Repo](https://img.shields.io/badge/GitHub-Repo-black)](https://github.com/CJL196/VMAS-MARL-Transport)
 
 > 2025 SYSU 强化学习课程大作业 —— 基于 VMAS 仿真器的多智能体协作任务复现
 
