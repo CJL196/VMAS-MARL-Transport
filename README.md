@@ -36,11 +36,9 @@
 │   └── scenarios/
 │       └── transport.py    # ⭐ Transport 任务场景 (已添加详细中文注释)
 ├── report.md               # 📝 实验报告
-├── assets/                 # 实验资源
-│   ├── mappo_transport_success_0.gif/mp4  # 演示视频
-│   └── mean_episode_return.png            # 训练曲线图
-└── draft/
-    └── requirement.md      # 作业要求
+└── assets/                 # 实验资源
+    ├── mappo_transport_success_0.gif/mp4  # 演示视频
+    └── mean_episode_return.png            # 训练曲线图
 ```
 
 ## 源码注释说明
@@ -124,4 +122,4 @@ wandb login
 ## 参考资料
 
 - 论文：[VMAS: A Vectorized Multi-Agent Simulator for Collective Robot Learning](https://arxiv.org/abs/2207.03530)
-- 官方仓库：[proroklab/VectorizedMultiAgentSimulator](https://github.com/proroklab/VectorizedMultiAgentSimulator)
+- VMAS官方仓库：[proroklab/VectorizedMultiAgentSimulator](https://github.com/proroklab/VectorizedMultiAgentSimulator) (本项目基于VMAS官方仓库修改)
