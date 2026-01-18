@@ -18,6 +18,38 @@ $L^{\text{CLIP}}(\theta) = \mathbb{E}_t \left[ \min \left( r_t(\theta) A_t, \; \
 
 PPO 还使用广义优势估计（GAE）来平衡优势估计的偏差和方差。定义时序差分误差 $\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)$，GAE 将不同步数的优势估计进行指数加权平均：$A_t^{GAE} = \sum_{l=0}^{\infty} (\gamma \lambda)^l \delta_{t+l}$。参数 $\lambda \in [0, 1]$ 控制了偏差-方差的权衡：当 $\lambda = 0$ 时仅看一步差分，偏差低但方差高；当 $\lambda = 1$ 时看所有步的差分，偏差高但方差低。
 
+### VMAS 物理仿真引擎深度解析
+
+VMAS（Vectorized Multi-Agent Simulator）是一个基于 PyTorch 构建的向量化多智能体仿真器，其核心优势在于能够利用 GPU 并行计算同时模拟数千个环境实例。理解 VMAS 的物理引擎对于分析实验结果至关重要。
+
+#### 向量化并行计算
+
+VMAS 的核心设计理念是"批处理优先"（Batch-first）。所有物理状态（位置、速度、力）都以张量形式存储，第一维是并行环境数量 `batch_dim`。例如，在本实验中使用 1024 个并行环境时，每个智能体的位置张量形状为 `(1024, 2)`，表示 1024 个环境中该智能体的二维坐标。这种设计使得单次 PyTorch 张量运算即可更新所有环境的状态，相比传统的 for 循环逐环境模拟，速度提升可达 100 倍以上。
+
+#### 半隐式欧拉积分
+
+VMAS 使用**半隐式欧拉方法（Semi-implicit Euler）**进行物理状态积分，这是游戏物理引擎中常用的数值积分方法。其核心公式如下：
+
+$$
+\begin{aligned}
+\mathbf{v}_{t+1} &= (1 - \zeta) \cdot \mathbf{v}_t + \frac{\mathbf{F}_t}{m} \cdot \Delta t \quad \text{(先更新速度)} \\
+\mathbf{x}_{t+1} &= \mathbf{x}_t + \mathbf{v}_{t+1} \cdot \Delta t \quad \text{(再用新速度更新位置)}
+\end{aligned}
+$$
+
+其中 $\zeta$ 是阻尼系数（drag），$\mathbf{F}_t$ 是合力，$m$ 是质量，$\Delta t$ 是时间步长。与显式欧拉方法（先更新位置再更新速度）相比，半隐式欧拉具有更好的**能量守恒性**，不会出现系统能量随时间发散的问题，这对于长时间运行的强化学习训练尤为重要。
+
+#### 力的计算与碰撞响应
+
+在每个仿真步中，VMAS 按以下顺序计算作用力：
+
+1. **动作力 $\mathbf{F}^a$**：由智能体策略网络输出的控制力
+2. **重力 $\mathbf{F}^g$**：可选的全局重力场（Transport 场景中为零）
+3. **摩擦力 $\mathbf{F}^f$**：与速度方向相反的阻力
+4. **碰撞力 $\mathbf{F}^c$**：基于穿透深度的惩罚力，公式为 $\mathbf{F}^c = k \cdot \max(0, d_{min} - d) \cdot \hat{\mathbf{n}}$
+
+其中 $k$ 是碰撞刚度系数，$d$ 是两物体间距，$d_{min}$ 是最小允许距离，$\hat{\mathbf{n}}$ 是碰撞法向量。这种基于惩罚力的碰撞模型计算简单且易于向量化，适合大规模并行仿真。
+
 ### CPPO、MAPPO、IPPO
 
 这三种算法都基于 PPO，核心区别在于 Actor（策略网络）和 Critic（价值网络）的输入和结构设计。根据中心化程度的不同，它们形成了一个算法谱系。
@@ -27,6 +59,64 @@ CPPO（Centralized PPO）将多智能体问题完全简化为单智能体问题�
 MAPPO（Multi-Agent PPO）采用中心化训练、分布式执行的范式。每个智能体拥有独立的 Actor 网络，仅根据自己的局部观测输出动作，这保证了执行时的可扩展性。但在训练时，所有智能体共享一个集中式的 Critic，该 Critic 接收全局状态信息来估计价值函数。这种设计使得智能体在训练时能够利用全局信息学习更好的价值估计，从而产生更稳定的梯度，但执行时仍保持分布式特性。智能体之间通常采用参数共享策略，使得它们能从彼此的经验中学习。
 
 IPPO（Independent PPO）是最简单的分布式方法。每个智能体完全独立地使用 PPO 进行学习，Actor 和 Critic 都只接收局部观测作为输入。尽管智能体之间没有显式的协调机制，但通过参数共享（所有智能体使用相同的网络权重），它们仍然能够从集体经验中受益。IPPO 的优点是实现简单、可扩展性好，并且对于需要高度初始探索的任务（如 Transport），分布式策略反而比中心化策略更容易学到有效行为。
+
+#### 算法架构对比
+
+下图展示了三种算法的数据流架构。以 $N=4$ 个智能体、观测维度 $O_{dim}=18$、动作维度 $A_{dim}=2$ 为例：
+
+```mermaid
+flowchart LR
+    subgraph CPPO["CPPO: 完全中心化"]
+        direction TB
+        O1["全局状态<br/>(N×O_dim=72)"]
+        A1["Actor"]
+        C1["Critic"]
+        Act1["联合动作<br/>(N×A_dim=8)"]
+        V1["V(s)"]
+        O1 --> A1 --> Act1
+        O1 --> C1 --> V1
+    end
+    
+    subgraph MAPPO["MAPPO: CTDE"]
+        direction TB
+        O2["局部观测<br/>(O_dim=18)"]
+        S2["全局状态<br/>(N×O_dim=72)"]
+        A2["Actor"]
+        C2["Critic"]
+        Act2["个体动作<br/>(A_dim=2)"]
+        V2["V(s)"]
+        O2 --> A2 --> Act2
+        S2 --> C2 --> V2
+    end
+    
+    subgraph IPPO["IPPO: 完全分布式"]
+        direction TB
+        O3["局部观测<br/>(O_dim=18)"]
+        A3["Actor"]
+        C3["Critic"]
+        Act3["个体动作<br/>(A_dim=2)"]
+        V3["V(o)"]
+        O3 --> A3 --> Act3
+        O3 --> C3 --> V3
+    end
+```
+
+#### 复杂度分析
+
+下表对比了三种算法在不同维度上的复杂度，其中 $N$ 为智能体数量，$O$ 为单智能体观测维度，$A$ 为单智能体动作维度，$H$ 为隐藏层维度：
+
+| 特性 | CPPO | MAPPO | IPPO |
+|------|------|-------|------|
+| **Actor 输入维度** | $N \times O$ | $O$ | $O$ |
+| **Actor 输出维度** | $N \times A$ | $A$ | $A$ |
+| **Critic 输入维度** | $N \times O$ | $N \times O$ | $O$ |
+| **Actor 参数量** | $O(N^2 \cdot O \cdot H)$ | $O(O \cdot H)$ | $O(O \cdot H)$ |
+| **Critic 参数量** | $O(N \cdot O \cdot H)$ | $O(N \cdot O \cdot H)$ | $O(O \cdot H)$ |
+| **执行时通信需求** | 需要全局状态 | 无需通信 | 无需通信 |
+| **训练时通信需求** | 需要全局状态 | 需要全局状态 | 无需通信 |
+| **可扩展性** | 差（维度爆炸） | 中等 | 好 |
+
+从表中可以看出，CPPO 的 Actor 参数量随智能体数量平方增长，这是其在大规模场景中失效的根本原因。MAPPO 通过将 Actor 分布式化解决了动作空间爆炸问题，但 Critic 仍需处理全局状态。IPPO 完全避免了维度爆炸，但代价是 Critic 无法利用其他智能体的信息进行更准确的价值估计。
 
 ## 关键代码
 
